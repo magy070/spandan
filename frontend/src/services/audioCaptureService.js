@@ -75,7 +75,7 @@ export async function captureDualDevice(primaryMicId, secondaryDeviceId) {
     }
 
     // 3. Mix primary and secondary streams using Web Audio API
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
+    audioContext = new (window.AudioContext || window.webkitAudioContext)()
     if (audioContext.state === 'suspended') {
       await audioContext.resume()
     }
@@ -185,7 +185,7 @@ export async function captureWithSystemAudio(micDeviceId = null) {
     }
 
     // 3. Mix mic stream and system audio stream
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
+    audioContext = new (window.AudioContext || window.webkitAudioContext)()
     if (audioContext.state === 'suspended') {
       await audioContext.resume()
     }
