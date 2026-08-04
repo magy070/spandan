@@ -1,5 +1,5 @@
 import express from 'express'
-import { authenticate, authorize } from '../middleware/auth.js'
+import { authenticate, authorize, requireApprovedTeacher } from '../middleware/auth.js'
 import { transcribe as sarvamTranscribe } from '../services/sarvamTranscriptionService.js'
 
 const router = express.Router()
@@ -33,7 +33,7 @@ router.get('/status', authenticate, async (req, res) => {
 })
 
 // Transcribe an audio chunk — routes to Whisper (default) or Sarvam based on provider
-router.post('/transcribe', authenticate, authorize('teacher'), async (req, res) => {
+router.post('/transcribe', authenticate, authorize('teacher'), requireApprovedTeacher, async (req, res) => {
   if (!req.body || !req.body.audio) {
     return res.status(400).json({ error: 'No audio provided' })
   }
