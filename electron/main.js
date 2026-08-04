@@ -221,7 +221,12 @@ app.whenReady().then(() => {
         console.error('[DisplayMedia] Error fetching desktop capturer sources:', err);
         callback({ video: null, audio: null });
       });
-    });
+    }, { useSystemPicker: true }); // <-- ADDED: required on macOS so getDisplayMedia's
+                                    //     audio: 'loopback' request routes through Apple's
+                                    //     native ScreenCaptureKit picker. Without this,
+                                    //     macOS silently returns video with no audio track,
+                                    //     even after Screen Recording permission is granted.
+                                    //     Harmless / mostly no-op on Windows.
   }
 
   createWindow();
