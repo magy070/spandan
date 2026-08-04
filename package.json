@@ -39,6 +39,7 @@
     "productName": "Spandan",
     "executableName": "Spandan",
     "asar": true,
+    "electronVersion": "34.5.8",
     "compression": "maximum",
     "icon": "frontend/public/spandan-icon.ico",
     "directories": {
