@@ -51,14 +51,24 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
           return
         }
         if (payload?.leaderboard) {
-          setLeaderboard(payload.leaderboard)
           if (typeof payload.totalParticipants === 'number') setTotalParticipants(payload.totalParticipants)
-          // If this student is within the broadcast top-N, refresh their rank from it.
-          // Outside top-N, their rank refreshes on their own next submit (myRank prop).
-          if (userId) {
-            const me = payload.leaderboard.find(e => e.studentId === userId)
-            if (me) setUserRank(me.rank)
-          }
+          
+          setLeaderboard(prev => {
+            let newBoard = [...payload.leaderboard]
+            if (userId) {
+              const meInNew = newBoard.find(e => e.studentId === userId)
+              if (meInNew) {
+                setUserRank(meInNew.rank)
+              } else {
+                // User is not in the new top-N. Find them in our current state to preserve them
+                const meInOld = prev.find(e => e.studentId === userId || e.isCurrentUser)
+                if (meInOld) {
+                  newBoard.push({ ...meInOld, isCurrentUser: true })
+                }
+              }
+            }
+            return newBoard
+          })
         }
       }
       socket.on('leaderboard:updated', handleLiveUpdate)
@@ -110,6 +120,34 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
     )
   }
 
+  const getRenderItems = () => {
+    if (isTeacher) {
+      return leaderboard
+    }
+
+    // Students only see the top 10, plus their own row at the bottom (with ellipsis) if they are outside top 10
+    const top10 = leaderboard.slice(0, 10).map(entry => ({
+      ...entry,
+      isCurrentUser: entry.isCurrentUser || (userId && entry.studentId === userId)
+    }))
+
+    const me = leaderboard.find(e => e.isCurrentUser || (userId && e.studentId === userId))
+    const isMeInTop10 = top10.some(e => e.studentId === userId)
+
+    if (me && !isMeInTop10) {
+      return [
+        ...top10,
+        {
+          ...me,
+          isCurrentUser: true,
+          showEllipsisBefore: true
+        }
+      ]
+    }
+
+    return top10
+  }
+
   const renderRank = (entry, index) => {
     const rank = entry.rank
     const isCurrentUser = entry.isCurrentUser
@@ -123,93 +161,7 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
     const subColor = isHighlighted ? '#6b7280' : 'var(--text-secondary)'
     const pointsColor = rank === 1 ? '#f59e0b' : isHighlighted ? '#1f2937' : 'var(--text-primary)'
 
-    // If not teacher and there's a gap between current entry and previous
-    // AND this entry is the user's rank (and not in top 10 shown), show ellipsis before
-    if (!isTeacher && index === 10 && userRank && userRank > 10) {
-      // We're showing position 10 (the user's entry), show ellipsis before
-      return (
-        <>
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '8px 0',
-            color: 'var(--text-secondary)',
-            fontSize: '12px',
-            flexShrink: 0
-          }}>
-            •••
-          </div>
-          <div key={entry.studentId} style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            padding: '8px 10px',
-            minWidth: 0,
-            width: '100%',
-            maxWidth: '100%',
-            overflow: 'hidden',
-            background: 'linear-gradient(135deg, #dbeafe, #bfdbfe)',
-            borderRadius: '10px',
-            border: '2px solid #3b82f6',
-            boxShadow: '0 2px 8px rgba(59, 130, 246, 0.3)',
-            boxSizing: 'border-box',
-            flexShrink: 0
-          }}>
-            <span style={{
-              width: '28px',
-              height: '28px',
-              borderRadius: '50%',
-              background: '#3b82f6',
-              color: 'white',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '12px',
-              fontWeight: '700',
-              flexShrink: 0
-            }}>
-              {rank}
-            </span>
-            <div style={{ flex: '1 1 auto', minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}>
-              <div style={{
-                fontSize: '14px',
-                fontWeight: '600',
-                color: '#1f2937',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                maxWidth: '100%'
-              }}>
-                {entry.studentName} (You)
-              </div>
-              <div style={{
-                fontSize: '11px',
-                color: '#6b7280',
-                marginTop: '2px'
-              }}>
-                {entry.correctCount}/{entry.totalAnswered} correct
-              </div>
-            </div>
-            <div style={{
-              fontSize: '16px',
-              fontWeight: '700',
-              color: '#3b82f6',
-              textAlign: 'right',
-              flexShrink: 0,
-              minWidth: '45px',
-              maxWidth: '45px',
-              overflow: 'hidden'
-            }}>
-              {entry.totalPoints}
-              <span style={{ fontSize: '10px', fontWeight: '500', marginLeft: '2px' }}>pts</span>
-            </div>
-          </div>
-        </>
-      )
-    }
-    
-    return (
+    const renderedRow = (
       <div key={entry.studentId} style={{
         display: 'flex',
         alignItems: 'center',
@@ -221,19 +173,19 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
         overflow: 'hidden',
         boxSizing: 'border-box',
         flexShrink: 0,
-        background: entry.rank === 1 ? 'linear-gradient(135deg, #fef3c7, #fde68a)' :
-                     entry.rank === 2 ? 'linear-gradient(135deg, #f3f4f6, #e5e7eb)' :
-                     entry.rank === 3 ? 'linear-gradient(135deg, #fef3c7, #fde68a)' : 
+        background: rank === 1 ? 'linear-gradient(135deg, #fef3c7, #fde68a)' :
+                     rank === 2 ? 'linear-gradient(135deg, #f3f4f6, #e5e7eb)' :
+                     rank === 3 ? 'linear-gradient(135deg, #fef3c7, #fde68a)' : 
                      isCurrentUser ? 'linear-gradient(135deg, #dbeafe, #bfdbfe)' : 'var(--bg-primary)',
         borderRadius: '10px',
-        border: entry.rank <= 3 ? `2px solid ${entry.rank === 1 ? '#f59e0b' : entry.rank === 2 ? '#9ca3af' : '#d97706'}` : 
+        border: rank <= 3 ? `2px solid ${rank === 1 ? '#f59e0b' : rank === 2 ? '#9ca3af' : '#d97706'}` : 
                isCurrentUser ? '2px solid #3b82f6' : '1px solid var(--border-color)'
       }}>
         <span style={{
           width: '28px',
           height: '28px',
           borderRadius: '50%',
-          background: entry.rank === 1 ? '#f59e0b' : entry.rank === 2 ? '#6b7280' : entry.rank === 3 ? '#d97706' : 'var(--border-color)',
+          background: rank === 1 ? '#f59e0b' : rank === 2 ? '#6b7280' : rank === 3 ? '#d97706' : 'var(--border-color)',
           color: 'white',
           display: 'flex',
           alignItems: 'center',
@@ -242,7 +194,7 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
           fontWeight: '700',
           flexShrink: 0
         }}>
-          {entry.rank <= 3 ? ['🥇', '🥈', '🥉'][entry.rank - 1] : rank}
+          {rank <= 3 ? ['🥇', '🥈', '🥉'][rank - 1] : rank}
         </span>
 
         <div style={{ flex: '1 1 auto', minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}>
@@ -281,7 +233,30 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
         </div>
       </div>
     )
+
+    if (entry.showEllipsisBefore) {
+      return (
+        <div key={`ellipsis-group-${entry.studentId}`} style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' }}>
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '8px 0',
+            color: 'var(--text-secondary)',
+            fontSize: '12px',
+            flexShrink: 0
+          }}>
+            •••
+          </div>
+          {renderedRow}
+        </div>
+      )
+    }
+
+    return renderedRow
   }
+
+  const visibleItems = getRenderItems()
 
   return (
     <div style={{ position: 'relative', width: '100%', minWidth: 0, maxWidth: '100%' }}>
@@ -297,7 +272,7 @@ const Leaderboard = ({ roomId, token, socket, userId, myRank }) => {
         maxHeight: '60vh',
         boxSizing: 'border-box'
       }}>
-        {leaderboard.map((entry, index) => renderRank(entry, index))}
+        {visibleItems.map((entry, index) => renderRank(entry, index))}
 
         {/* Show total participants count */}
         {!isTeacher && totalParticipants > 10 && (
