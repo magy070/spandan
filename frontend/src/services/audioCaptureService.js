@@ -9,7 +9,7 @@
  */
 export async function captureMicOnly(deviceId = null) {
   const constraints = {
-    audio: deviceId ? { deviceId: { exact: deviceId } } : true
+    audio: deviceId ? { deviceId: { ideal: deviceId } } : true
   }
 
   const stream = await navigator.mediaDevices.getUserMedia(constraints)
@@ -133,7 +133,7 @@ export async function captureWithSystemAudio(micDeviceId = null) {
   try {
     // 1. Get mic stream
     const micConstraints = {
-      audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true
+      audio: micDeviceId ? { deviceId: { ideal: micDeviceId } } : true
     }
     micStream = await navigator.mediaDevices.getUserMedia(micConstraints)
 
