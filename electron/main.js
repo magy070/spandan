@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, shell, session, desktopCapturer, Notification, dialog, ipcMain } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -22,6 +22,7 @@ const MIME_TYPES = {
 
 let prodServer = null;
 let backendProcess = null;
+let mainWindow = null;
 
 function getTunnelUrl() {
   try {
@@ -187,6 +188,8 @@ async function createWindow() {
     }
   });
 
+  mainWindow = win;
+
   win.once('ready-to-show', () => {
     win.show();
   });
@@ -207,6 +210,54 @@ async function createWindow() {
     win.loadURL(`http://127.0.0.1:${port}/spandan/`);
   }
 }
+
+// --- IPC handlers (registered once, before any window is created) ---
+
+// Native desktop notifications (Change 2)
+ipcMain.handle('notification:show', (_event, payload) => {
+  if (!Notification.isSupported()) {
+    return { ok: false, reason: 'not-supported' };
+  }
+
+  const title = String(payload?.title ?? '').slice(0, 200);
+  const body = String(payload?.body ?? '').slice(0, 500);
+
+  if (!title) {
+    return { ok: false, reason: 'missing-title' };
+  }
+
+  const notif = new Notification({ title, body });
+  notif.on('click', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+  notif.show();
+  return { ok: true };
+});
+
+// Native file dialogs (Change 3)
+ipcMain.handle('dialog:openFile', async (_event, options) => {
+  const title = String(options?.title ?? 'Open File').slice(0, 200);
+  const filters = Array.isArray(options?.filters) && options.filters.length > 0
+    ? options.filters
+    : [{ name: 'All Files', extensions: ['*'] }];
+
+  const result = await dialog.showOpenDialog(mainWindow, { title, filters });
+  return { canceled: result.canceled, filePaths: result.filePaths };
+});
+
+ipcMain.handle('dialog:saveFile', async (_event, options) => {
+  const title = String(options?.title ?? 'Save File').slice(0, 200);
+  const defaultPath = options?.defaultPath ? String(options.defaultPath) : undefined;
+  const filters = Array.isArray(options?.filters) && options.filters.length > 0
+    ? options.filters
+    : [{ name: 'All Files', extensions: ['*'] }];
+
+  const result = await dialog.showSaveDialog(mainWindow, { title, defaultPath, filters });
+  return { canceled: result.canceled, filePath: result.filePath };
+});
 
 app.whenReady().then(() => {
   if (session.defaultSession.setDisplayMediaRequestHandler) {

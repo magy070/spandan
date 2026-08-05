@@ -61,7 +61,11 @@
       "artifactName": "Spandan-Portable.exe"
     },
     "mac": {
-      "icon": "frontend/public/spandan-icon.png"
+      "icon": "frontend/public/spandan-icon.png",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Spandan needs microphone access to record your voice during live sessions.",
+        "NSCameraUsageDescription": "Spandan needs camera access for video during live sessions."
+      }
     }
   }
 }
