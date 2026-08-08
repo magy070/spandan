@@ -22,7 +22,7 @@ import { API_URL } from '../config.js'
 import MicDeviceSelector from '../components/MicDeviceSelector'
 import AudioSetupWizard from '../components/AudioSetupWizard'
 import SystemAudioSetupModal from '../components/SystemAudioSetupModal'
-import { captureMicOnly, captureDualDevice, captureWithSystemAudio } from '../services/audioCaptureService'
+import { captureMicOnly, captureDualDevice, captureWithSystemAudio, captureTabAndMicAudio } from '../services/audioCaptureService'
 import { supportsSystemAudioCapture } from '../utils/browserDetect'
 
 
@@ -78,6 +78,35 @@ function RoomDetailPage() {
   const cleanupAudioRef = useRef(null)
   const [audioWarning, setAudioWarning] = useState(null)
 
+  // Speaker microphone in video mode state
+  const setMicEnabledRef = useRef(null)
+  const enableMicLiveRef = useRef(null)
+  const displayStreamRef = useRef(null)
+  const [includeSpeakerMic, setIncludeSpeakerMic] = useState(true)
+  const [speakerMicMuted, setSpeakerMicMuted] = useState(false)
+  const [isMicMixedInVideo, setIsMicMixedInVideo] = useState(false)
+  const [isStartingVideoSession, setIsStartingVideoSession] = useState(false)
+  const [isEnablingMicLive, setIsEnablingMicLive] = useState(false)
+
+  const toggleSpeakerMic = () => {
+    const nextMuted = !speakerMicMuted
+    setSpeakerMicMuted(nextMuted)
+    if (setMicEnabledRef.current) {
+      setMicEnabledRef.current(!nextMuted)
+    }
+  }
+
+  const handleEnableMicLive = async () => {
+    if (!enableMicLiveRef.current) return
+    setIsEnablingMicLive(true)
+    const result = await enableMicLiveRef.current(primaryAudioDevice)
+    setIsEnablingMicLive(false)
+    if (result.success) {
+      setIsMicMixedInVideo(true)
+      setSpeakerMicMuted(false)
+    }
+  }
+
 
   // Transcription queue for ordered processing
   const transcriptionQueueRef = useRef([])
@@ -90,6 +119,7 @@ function RoomDetailPage() {
   const [segmentTranscript, setSegmentTranscript] = useState('')
   const [segmentTimeLeft, setSegmentTimeLeft] = useState(0)
   const segmentTimerRef = useRef(null)
+  const pendingNextSegmentRef = useRef(false)
 
   // Question timer for teacher visibility
   const [activeQuestion, setActiveQuestion] = useState(null)
@@ -316,10 +346,108 @@ function RoomDetailPage() {
     }
   }
 
+  const generateQuestionsFromText = async (text, segmentIndex) => {
+    setIsGeneratingQuestions(true)
+    // New controller per generation; aborted on unmount (see the [roomId] effect cleanup).
+    genAbortRef.current = new AbortController()
+    try {
+      // Backend may answer synchronously (no Redis) or async with a jobId; the helper polls the
+      // job internally and returns the same { success, questions } shape either way.
+      const data = await requestQuestionGeneration(text, {
+        numQuestions: roomSettings.questionsPerSegment,
+        difficulty: roomSettings.difficulty,
+        provider: roomSettings.questionProvider || 'minimax',
+        questionTypeMix: roomSettings.questionTypeMix || { MCQ: 0, TF: 100, MSQ: 0 }
+      }, { signal: genAbortRef.current.signal })
+
+      setIsGeneratingQuestions(false)
+      if (data.success && data.questions && data.questions.length > 0) {
+        return data.questions.map(q => ({
+          ...q,
+          timeToAnswer: roomSettings.timeToAnswer,
+          points: roomSettings.points,
+          segmentIndex
+        }))
+      }
+      throw new Error(data.error || 'No questions generated')
+    } catch (error) {
+      setIsGeneratingQuestions(false)
+      throw error
+    }
+  }
+
+  // On segment timer hit zero - auto-save and auto-generate questions
+  const handleSegmentComplete = async () => {
+    console.log('[SEGMENT] Timer hit zero - handling segment completion')
+
+    // PAUSE: stop capturing and flush the final complete audio window before using the transcript.
+    // In video mode keep the shared tab-audio stream alive for the next segment (only stop the loop).
+    if (isVideoMode) {
+      await stopVideoTranscriptionLoop()
+      ytPlayerRef.current?.pauseVideo?.() // stop the video while questions generate and the poll runs
+    } else {
+      await stopRecording()
+    }
+
+    if (segmentTimerRef.current) {
+      clearInterval(segmentTimerRef.current)
+      segmentTimerRef.current = null
+    }
+
+    // Mark as pending review
+    setIsPendingReview(true)
+    setGenerateQEnabled(false) // Disable manual button during auto-process
+
+    // Capture transcript
+    const textToUse = (segmentTranscriptRef.current || '').trim() || (transcript || '').trim()
+
+    if (!textToUse || textToUse.length < 50) {
+      console.log('[SEGMENT] Transcript too short (<50 chars), showing warning')
+      window.alert('Transcription too short. Please speak more or trigger manually after starting next segment.')
+
+      // Resume for next segment
+      setIsPendingReview(false)
+      setGenerateQEnabled(true)
+      setCurrentSegment(prev => prev + 1)
+      setTranscript('')
+      setSegmentTranscript('')
+      segmentTranscriptRef.current = ''
+      finalTranscriptRef.current = ''
+      accumulatedTranscriptRef.current = ''
+      startRecording({ resetSegment: false })
+      if (isVideoMode) resumeTeacherVideo()
+      return
+    }
+
+    let generated = null
+    try {
+      console.log('[SEGMENT] Auto-generating questions...')
+      generated = await generateQuestionsFromText(textToUse, currentSegment)
+    } catch (error) {
+      console.error('[SEGMENT] First generation attempt failed:', error)
+      try {
+        console.log('[SEGMENT] Retrying question generation...')
+        generated = await generateQuestionsFromText(textToUse, currentSegment)
+      } catch (retryError) {
+        console.error('[SEGMENT] Retry also failed:', retryError)
+        window.alert('Failed to generate questions after retry. You can use the manual "Generate Q" button.')
+        setGenerateQEnabled(true)
+        return
+      }
+    }
+
+    if (generated && generated.length > 0) {
+      setPendingQuestions(generated)
+      setShowQuestionPopup(true)
+      setIsPopupOpen(true)
+      saveTranscript(room._id, currentSegment, textToUse, roomSettings.segmentTime * 60)
+        .catch((err) => console.error('[SEGMENT] Failed to save transcript:', err))
+    }
+  }
+
   const startSegmentTimer = (startFromSeconds = null) => {
     console.log('[TIMER] startSegmentTimer called, segmentTime:', roomSettings.segmentTime, 'startFrom:', startFromSeconds)
 
-    // Clear any existing timer
     if (segmentTimerRef.current) {
       clearInterval(segmentTimerRef.current)
       segmentTimerRef.current = null
@@ -373,113 +501,6 @@ function RoomDetailPage() {
     if (isSegmentPaused && segmentTimeLeft > 0) {
       console.log('[TIMER] Resuming timer from', segmentTimeLeft, 'seconds')
       startSegmentTimer(segmentTimeLeft)
-    }
-  }
-
-  // On segment timer hit zero - auto-save and auto-generate questions
-  const handleSegmentComplete = async () => {
-    console.log('[SEGMENT] Timer hit zero - handling segment completion')
-
-    // PAUSE: stop capturing and flush the final complete audio window before using the transcript.
-    // In video mode keep the shared tab-audio stream alive for the next segment (only stop the loop).
-    if (isVideoMode) {
-      await stopVideoTranscriptionLoop()
-      ytPlayerRef.current?.pauseVideo?.() // stop the video while questions generate and the poll runs
-    } else {
-      await stopRecording()
-    }
-
-    if (segmentTimerRef.current) {
-      clearInterval(segmentTimerRef.current)
-      segmentTimerRef.current = null
-    }
-
-    // Mark as pending review
-    setIsPendingReview(true)
-    setGenerateQEnabled(false) // Disable manual button during auto-process
-
-    // Capture transcript
-    const textToUse = segmentTranscriptRef.current.trim() || transcript.trim()
-
-    if (!textToUse || textToUse.length < 50) {
-      console.log('[SEGMENT] Transcript too short (<50 chars), showing warning')
-      // Show warning toast - use window.alert for now since no toast library imported
-      window.alert('Transcription too short. Please speak more or trigger manually after starting next segment.')
-
-      // Resume for next segment
-      setIsPendingReview(false)
-      setGenerateQEnabled(true)
-      setCurrentSegment(prev => prev + 1)
-      setTranscript('')
-      setSegmentTranscript('')
-      segmentTranscriptRef.current = ''
-      finalTranscriptRef.current = ''
-      accumulatedTranscriptRef.current = ''
-      startRecording({ resetSegment: false })
-      if (isVideoMode) resumeTeacherVideo()
-      return
-    }
-
-    // Auto-generate questions FIRST. The transcript save is intentionally NOT done before this and
-    // never gates generation — a failed/hung transcript POST used to abort the whole segment with no
-    // questions. We save the transcript only after questions are produced (below), fire-and-forget.
-    let generated = null
-    try {
-      console.log('[SEGMENT] Auto-generating questions...')
-      generated = await generateQuestionsFromText(textToUse, currentSegment)
-    } catch (error) {
-      console.error('[SEGMENT] First generation attempt failed:', error)
-      // Auto-retry once
-      try {
-        console.log('[SEGMENT] Retrying question generation...')
-        generated = await generateQuestionsFromText(textToUse, currentSegment)
-      } catch (retryError) {
-        console.error('[SEGMENT] Retry also failed:', retryError)
-        window.alert('Failed to generate questions after retry. You can use the manual "Generate Q" button.')
-        setGenerateQEnabled(true) // Enable fail-safe manual button
-        return
-      }
-    }
-
-    if (generated && generated.length > 0) {
-      setPendingQuestions(generated)
-      setShowQuestionPopup(true)
-      setIsPopupOpen(true)
-      // Questions are in hand and the review popup is up — NOW persist the transcript, fire-and-forget
-      // so a slow/failed/hung save can never block the pipeline or lose the generated questions.
-      // source defaults to 'audio' (real segment).
-      saveTranscript(room._id, currentSegment, textToUse, roomSettings.segmentTime * 60)
-        .catch((err) => console.error('[SEGMENT] Failed to save transcript (questions already generated):', err))
-    }
-  }
-
-  const generateQuestionsFromText = async (text, segmentIndex) => {
-    setIsGeneratingQuestions(true)
-    // New controller per generation; aborted on unmount (see the [roomId] effect cleanup).
-    genAbortRef.current = new AbortController()
-    try {
-      // Backend may answer synchronously (no Redis) or async with a jobId; the helper polls the
-      // job internally and returns the same { success, questions } shape either way.
-      const data = await requestQuestionGeneration(text, {
-        numQuestions: roomSettings.questionsPerSegment,
-        difficulty: roomSettings.difficulty,
-        provider: roomSettings.questionProvider || 'minimax',
-        questionTypeMix: roomSettings.questionTypeMix || { MCQ: 0, TF: 100, MSQ: 0 }
-      }, { signal: genAbortRef.current.signal })
-
-      setIsGeneratingQuestions(false)
-      if (data.success && data.questions && data.questions.length > 0) {
-        return data.questions.map(q => ({
-          ...q,
-          timeToAnswer: roomSettings.timeToAnswer,
-          points: roomSettings.points,
-          segmentIndex
-        }))
-      }
-      throw new Error(data.error || 'No questions generated')
-    } catch (error) {
-      setIsGeneratingQuestions(false)
-      throw error
     }
   }
 
@@ -684,7 +705,13 @@ function RoomDetailPage() {
 
     const sequence = nextSequenceRef.current++
     const chunks = []
-    const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType: selectedMimeTypeRef.current })
+    let mediaRecorder = null
+    try {
+      mediaRecorder = new MediaRecorder(streamRef.current, { mimeType: selectedMimeTypeRef.current })
+    } catch (e) {
+      console.warn('[RECORDING] MediaRecorder with mimeType failed, fallback to default:', e)
+      mediaRecorder = new MediaRecorder(streamRef.current)
+    }
     mediaRecorderRef.current = mediaRecorder
 
     mediaRecorderStopPromiseRef.current = new Promise((resolve) => {
@@ -882,6 +909,9 @@ function RoomDetailPage() {
       streamRef.current.getTracks().forEach(track => track.stop())
       streamRef.current = null
     }
+    displayStreamRef.current = null
+    setMicEnabledRef.current = null
+    setIsMicMixedInVideo(false)
 
     if (segmentTimerRef.current) {
       clearInterval(segmentTimerRef.current)
@@ -971,34 +1001,54 @@ function RoomDetailPage() {
     setTimeout(seekToLiveEdge, 1200) // final catch for slow buffering/transition
   }
 
-  // Acquire the tab's audio ONCE. getDisplayMedia re-prompts on every call, so the stream must persist
-  // across the whole segment loop — unlike the mic path, which can re-acquire silently each segment.
+  // Acquire tab audio (and optionally speaker mic) ONCE.
+  // The stream must persist across segment loops because getDisplayMedia requires user gesture.
   const beginVideoSession = async () => {
-    if (isEnded || videoSessionActive) return
+    if (isEnded || videoSessionActive || isStartingVideoSession) return
+    setIsStartingVideoSession(true)
+    setModelStatus('Opening browser audio picker...')
     try {
-      // preferCurrentTab makes the browser's share picker default to THIS tab (and drop the
-      // window/screen chooser), so the teacher just clicks "Share" once instead of hunting for the
-      // right tab. Chromium-only hint; ignored elsewhere. The prompt itself can't be removed — the
-      // browser always requires an explicit user confirm for screen/tab capture.
-      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true, preferCurrentTab: true })
-      const audioTracks = display.getAudioTracks()
-      if (!audioTracks.length) {
-        display.getTracks().forEach(t => t.stop())
+      const result = await captureTabAndMicAudio({
+        micDeviceId: primaryAudioDevice,
+        includeMic: includeSpeakerMic
+      })
+
+      displayStreamRef.current = result.displayStream
+
+      const displayAudioTrack = result.displayStream?.getAudioTracks()?.[0]
+      if (!displayAudioTrack) {
+        result.cleanup()
         setModelStatus('No tab audio — re-share and tick "Share tab audio"')
         return
       }
-      display.getVideoTracks().forEach(t => t.stop()) // only the audio is needed
-      const stream = new MediaStream(audioTracks)
-      // If the teacher stops sharing via the browser UI, end the capture session.
-      audioTracks[0].addEventListener('ended', () => {
+
+      displayAudioTrack.addEventListener('ended', () => {
         setVideoSessionActive(false)
         stopRecording()
       })
-      streamRef.current = stream
 
-      let selectedMimeType = 'audio/ogg'
-      for (const t of ['audio/ogg;codecs=opus', 'audio/ogg', 'audio/webm;codecs=opus', 'audio/webm']) {
-        if (MediaRecorder.isTypeSupported(t)) { selectedMimeType = t; break }
+      streamRef.current = result.combinedStream
+      cleanupAudioRef.current = result.cleanup
+      setMicEnabledRef.current = result.setMicEnabled
+      enableMicLiveRef.current = result.enableMicLive
+      setIsMicMixedInVideo(result.isMicActive)
+
+      if (result.isMicActive && speakerMicMuted) {
+        result.setMicEnabled(false)
+      }
+
+      let selectedMimeType = 'audio/webm;codecs=opus'
+      const possibleTypes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg'
+      ]
+      for (const mimeType of possibleTypes) {
+        if (MediaRecorder.isTypeSupported(mimeType)) {
+          selectedMimeType = mimeType
+          break
+        }
       }
       selectedMimeTypeRef.current = selectedMimeType
 
@@ -1009,18 +1059,31 @@ function RoomDetailPage() {
       pendingSequenceRef.current = 0; isProcessingQueueRef.current = false
       setCurrentSegment(1)
       setVideoSessionActive(true)
-      setModelStatus('Ready - press play to begin')
 
-      // If the video is already playing, begin capturing immediately.
-      if (ytPlayerRef.current?.getPlayerState?.() === 1) {
-        recordingActiveRef.current = true
-        setIsTranscribing(true); setModelStatus('Listening...')
-        startTranscriptionWindow()
-        setIsRecording(true)
+      // Start capturing & transcribing immediately upon starting session so speaker mic (and video audio) is active!
+      recordingActiveRef.current = true
+      setIsRecording(true)
+      setIsTranscribing(true)
+
+      if (result.micWarning) {
+        setModelStatus(result.micWarning)
+      } else {
+        setModelStatus('Listening...')
+      }
+
+      startTranscriptionWindow()
+      if (roomSettings.segmentTime > 0) {
+        startSegmentTimer(roomSettings.segmentTime * 60)
       }
     } catch (e) {
       console.error('beginVideoSession failed:', e)
-      setModelStatus('Tab share cancelled')
+      if (e.message === 'NO_TAB_AUDIO') {
+        setModelStatus('No tab audio — re-share and tick "Share tab audio"')
+      } else {
+        setModelStatus('Tab share cancelled — click Start Session to try again')
+      }
+    } finally {
+      setIsStartingVideoSession(false)
     }
   }
 
@@ -1037,25 +1100,34 @@ function RoomDetailPage() {
     // streamRef intentionally kept alive for the next segment.
   }
 
-  // Play -> (re)start the 10s transcription windows + arm/resume the segment timer. Stream stays alive.
+  // Play -> ensure transcription loop is active and sync with segment timer. If ending a segment, start next segment!
   const handleVideoPlay = () => {
     if (isEnded || !videoSessionActive) return
-    if (recordingActiveRef.current) return
-    recordingActiveRef.current = true
-    setIsTranscribing(true); setModelStatus('Listening...')
-    startTranscriptionWindow()
+
+    if (pendingNextSegmentRef.current) {
+      pendingNextSegmentRef.current = false
+      setCurrentSegment(prev => prev + 1)
+      setSegmentTranscript('')
+      segmentTranscriptRef.current = ''
+      if (roomSettings.segmentTime > 0) {
+        startSegmentTimer(roomSettings.segmentTime * 60)
+      }
+    }
+
+    if (!recordingActiveRef.current) {
+      recordingActiveRef.current = true
+      setIsRecording(true)
+      setIsTranscribing(true)
+      setModelStatus('Listening...')
+      startTranscriptionWindow()
+    }
     if (isSegmentPaused) resumeSegmentTimer()
-    else if (!isRecording) setIsRecording(true) // first play arms a fresh segment timer
   }
 
-  // Pause -> stop the transcription windows (flush current) + freeze the timer. Keep the stream.
+  // Pause -> video paused, but keep transcription active so speaker mic is captured while video is paused!
   const handleVideoPause = () => {
-    if (!videoSessionActive || !recordingActiveRef.current) return
-    recordingActiveRef.current = false
-    if (transcriptionIntervalRef.current) { clearTimeout(transcriptionIntervalRef.current); transcriptionIntervalRef.current = null }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop()
-    setIsTranscribing(false)
-    if (segmentTimerRef.current) pauseSegmentTimer()
+    if (!videoSessionActive) return
+    // Speaker microphone continues capturing & transcribing even when YouTube video is paused.
   }
 
   // Broadcast the teacher's video position so students can use it as their forward-seek ceiling
@@ -1118,6 +1190,18 @@ function RoomDetailPage() {
       setGenerateQEnabled(true)
     }
     setIsGeneratingQuestions(false)
+  }
+
+  const handleEndSegmentAndGenerate = async () => {
+    pendingNextSegmentRef.current = true
+    if (segmentTimerRef.current) {
+      clearInterval(segmentTimerRef.current)
+      segmentTimerRef.current = null
+    }
+    if (ytPlayerRef.current && typeof ytPlayerRef.current.pauseVideo === 'function') {
+      try { ytPlayerRef.current.pauseVideo() } catch (e) {}
+    }
+    await handleManualGenerateQuestions()
   }
 
   const handleApproveQuestion = async (question) => {
@@ -1311,6 +1395,7 @@ function RoomDetailPage() {
   }
 
   const isEnded = !!room.endedAt
+  const hasTranscriptText = Boolean((segmentTranscript || '').trim() || (transcript || '').trim())
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg-primary)', width: '100vw', maxWidth: '100vw', overflowX: 'hidden' }}>
@@ -1411,22 +1496,46 @@ function RoomDetailPage() {
 
             <div style={{ flex: 1, minWidth: 0, display: isMobile ? 'none' : 'block' }} />
 
-            {/* Segment Timer Display */}
-            {isRecording && (
+            {/* Segment Timer Display & End Segment Action */}
+            {(isRecording || videoSessionActive) && (
               <div style={{
-                padding: '8px 16px',
-                background: 'rgba(239, 68, 68, 0.1)',
+                padding: '6px 14px',
+                background: 'rgba(239, 68, 68, 0.08)',
+                border: '1px solid rgba(239, 68, 68, 0.25)',
                 borderRadius: '8px',
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px'
+                gap: '12px'
               }}>
-                <span style={{ fontSize: '14px', color: '#ef4444', fontWeight: '600' }}>
-                  Segment {currentSegment}
-                </span>
-                <span style={{ fontSize: '20px', color: '#ef4444', fontWeight: '700' }}>
-                  {formatTime(segmentTimeLeft)}
-                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '13px', color: '#ef4444', fontWeight: '600' }}>
+                    Segment {currentSegment || 1}
+                  </span>
+                  <span style={{ fontSize: '18px', color: '#ef4444', fontWeight: '700', fontFamily: 'monospace' }}>
+                    {formatTime(segmentTimeLeft)}
+                  </span>
+                </div>
+                <button
+                  onClick={handleEndSegmentAndGenerate}
+                  disabled={isGeneratingQuestions || !hasTranscriptText}
+                  style={{
+                    padding: '5px 12px',
+                    background: (isGeneratingQuestions || !hasTranscriptText) ? '#9ca3af' : '#dc2626',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '6px',
+                    fontSize: '12px',
+                    fontWeight: '600',
+                    cursor: (isGeneratingQuestions || !hasTranscriptText) ? 'not-allowed' : 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    transition: 'all 0.2s ease',
+                    boxShadow: (isGeneratingQuestions || !hasTranscriptText) ? 'none' : '0 2px 4px rgba(220, 38, 38, 0.2)'
+                  }}
+                >
+                  {isGeneratingQuestions ? 'Generating…' : '⚡ End Segment & Generate Qs'}
+                </button>
               </div>
             )}
 
@@ -1741,29 +1850,164 @@ function RoomDetailPage() {
                     </div>
                   )}
                   {videoId && !videoSessionActive && (
-                    <button
-                      onClick={beginVideoSession}
-                      disabled={isEnded}
-                      style={{
-                        width: '100%',
-                        marginTop: '12px',
-                        padding: '11px 16px',
-                        background: isEnded ? '#9ca3af' : 'var(--accent-gradient)',
-                        color: '#fff',
-                        border: 'none',
-                        borderRadius: 'var(--radius)',
-                        fontSize: '13px',
-                        fontWeight: 600,
-                        cursor: isEnded ? 'not-allowed' : 'pointer'
-                      }}
-                    >
-                      Start Session (share this tab's audio)
-                    </button>
+                    <div style={{ marginTop: '12px' }}>
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justify: 'space-between',
+                          padding: '10px 14px',
+                          marginBottom: '10px',
+                          background: 'var(--bg-secondary)',
+                          border: '1px solid var(--border-color)',
+                          borderRadius: 'var(--radius)',
+                          boxShadow: 'var(--shadow-sm)'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <span style={{ fontSize: '18px' }}>🎙️</span>
+                          <div>
+                            <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--text-primary)' }}>
+                              Include Speaker Microphone
+                            </div>
+                            <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                              Capture speaker voice alongside YouTube video audio
+                            </div>
+                          </div>
+                        </div>
+                        <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={includeSpeakerMic}
+                            onChange={(e) => setIncludeSpeakerMic(e.target.checked)}
+                            style={{
+                              width: '18px',
+                              height: '18px',
+                              accentColor: 'var(--accent)',
+                              cursor: 'pointer'
+                            }}
+                          />
+                        </label>
+                      </div>
+
+                      <button
+                        onClick={beginVideoSession}
+                        disabled={isEnded || isStartingVideoSession}
+                        style={{
+                          width: '100%',
+                          padding: '11px 16px',
+                          background: (isEnded || isStartingVideoSession) ? '#9ca3af' : 'var(--accent-gradient)',
+                          color: '#fff',
+                          border: 'none',
+                          borderRadius: 'var(--radius)',
+                          fontSize: '13px',
+                          fontWeight: 600,
+                          cursor: (isEnded || isStartingVideoSession) ? 'not-allowed' : 'pointer',
+                          transition: 'all 0.2s ease'
+                        }}
+                      >
+                        {isStartingVideoSession
+                          ? "Starting session… (select tab audio in browser prompt)"
+                          : (includeSpeakerMic
+                              ? "Start Session (share tab audio & speaker mic)"
+                              : "Start Session (share tab audio only)")}
+                      </button>
+                    </div>
+                  )}
+                  {videoId && videoSessionActive && (
+                    <div style={{ marginTop: '12px' }}>
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justify: 'space-between',
+                          padding: '9px 14px',
+                          background: isMicMixedInVideo
+                            ? (speakerMicMuted ? 'rgba(239, 68, 68, 0.1)' : 'rgba(34, 197, 94, 0.1)')
+                            : 'var(--bg-secondary)',
+                          border: `1px solid ${
+                            isMicMixedInVideo
+                              ? (speakerMicMuted ? 'rgba(239, 68, 68, 0.3)' : 'rgba(34, 197, 94, 0.3)')
+                              : 'var(--border-color)'
+                          }`,
+                          borderRadius: 'var(--radius)',
+                          fontSize: '12px'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span
+                            style={{
+                              width: '8px',
+                              height: '8px',
+                              borderRadius: '50%',
+                              background: isMicMixedInVideo
+                                ? (speakerMicMuted ? '#ef4444' : '#22c55e')
+                                : '#9ca3af',
+                              boxShadow: (isMicMixedInVideo && !speakerMicMuted) ? '0 0 8px #22c55e' : 'none',
+                              animation: (isMicMixedInVideo && !speakerMicMuted) ? 'blink 1.5s infinite' : 'none'
+                            }}
+                          />
+                          <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                            {isMicMixedInVideo
+                              ? (speakerMicMuted ? 'Speaker Mic: Muted' : 'Speaker Mic: Active (Listening)')
+                              : 'Speaker Mic: Off'}
+                          </span>
+                        </div>
+
+                        {isMicMixedInVideo ? (
+                          <button
+                            onClick={toggleSpeakerMic}
+                            style={{
+                              padding: '5px 12px',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              background: speakerMicMuted ? 'linear-gradient(135deg, #dc2626, #ef4444)' : 'transparent',
+                              color: speakerMicMuted ? '#ffffff' : 'var(--accent)',
+                              border: speakerMicMuted ? 'none' : '1px solid var(--accent)',
+                              borderRadius: 'var(--radius)',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              transition: 'all 0.2s ease'
+                            }}
+                          >
+                            {speakerMicMuted ? '🎙️ Unmute Mic' : '🔇 Mute Mic'}
+                          </button>
+                        ) : (
+                          <button
+                            onClick={handleEnableMicLive}
+                            disabled={isEnablingMicLive}
+                            style={{
+                              padding: '5px 12px',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              background: 'var(--accent-gradient)',
+                              color: '#ffffff',
+                              border: 'none',
+                              borderRadius: 'var(--radius)',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px'
+                            }}
+                          >
+                            {isEnablingMicLive ? 'Enabling…' : '🎙️ Enable Speaker Mic'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   )}
                   <p style={{ margin: '10px 0 0', fontSize: '12px', color: 'var(--text-secondary)', textAlign: 'center' }}>
                     {videoSessionActive
-                      ? (isTranscribing ? 'Listening to tab audio...' : 'Session ready - press play to capture.')
-                      : 'Share this tab’s audio, then play the video to capture the lecture.'}
+                      ? (isTranscribing
+                          ? (isMicMixedInVideo && !speakerMicMuted
+                              ? 'Listening to tab audio + speaker mic...'
+                              : 'Listening to tab audio...')
+                          : 'Session ready - press play to capture.')
+                      : (includeSpeakerMic
+                          ? 'Share this tab’s audio and speak into your mic, then play the video to capture.'
+                          : 'Share this tab’s audio, then play the video to capture the lecture.')}
                     {'  '}{modelStatus}
                   </p>
                 </div>
@@ -2076,24 +2320,24 @@ function RoomDetailPage() {
                     </button>
                   )}
                   <button
-                    onClick={handleManualGenerateQuestions}
-                    disabled={isGeneratingQuestions || !transcript || !generateQEnabled}
+                    onClick={handleEndSegmentAndGenerate}
+                    disabled={isGeneratingQuestions || !hasTranscriptText || !generateQEnabled}
                     style={{
                       padding: '4px 12px',
-                      background: '#3b82f6',
+                      background: (isGeneratingQuestions || !hasTranscriptText || !generateQEnabled) ? '#9ca3af' : '#3b82f6',
                       color: 'white',
                       border: 'none',
                       borderRadius: '6px',
                       fontSize: '12px',
-                      fontWeight: '500',
-                      cursor: isGeneratingQuestions || !transcript || !generateQEnabled ? 'not-allowed' : 'pointer',
-                      opacity: isGeneratingQuestions || !transcript || !generateQEnabled ? 0.6 : 1,
+                      fontWeight: '600',
+                      cursor: (isGeneratingQuestions || !hasTranscriptText || !generateQEnabled) ? 'not-allowed' : 'pointer',
+                      opacity: (isGeneratingQuestions || !hasTranscriptText || !generateQEnabled) ? 0.6 : 1,
                       display: 'flex',
                       alignItems: 'center',
                       gap: '4px'
                     }}
                   >
-                    {isGeneratingQuestions ? '⏳ Generating...' : '🔄 Generate Q'}
+                    {isGeneratingQuestions ? 'Generating…' : '⚡ End Segment & Generate Qs'}
                   </button>
                 </div>
               </div>

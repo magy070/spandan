@@ -261,23 +261,26 @@ ipcMain.handle('dialog:saveFile', async (_event, options) => {
 
 app.whenReady().then(() => {
   if (session.defaultSession.setDisplayMediaRequestHandler) {
+    console.log('[DisplayMedia] Registering setDisplayMediaRequestHandler, platform:', process.platform);
+    const opts = process.platform === 'darwin' ? { useSystemPicker: true } : {};
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
-      desktopCapturer.getSources({ types: ['screen', 'window'] }).then((sources) => {
+      console.log('[DisplayMedia] Handler invoked, request:', request);
+      desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
+        console.log('[DisplayMedia] Sources found:', sources.length);
         if (sources.length > 0) {
           callback({ video: sources[0], audio: 'loopback' });
+          console.log('[DisplayMedia] Callback invoked with source:', sources[0].id);
         } else {
+          console.log('[DisplayMedia] No sources found, calling back with null');
           callback({ video: null, audio: null });
         }
       }).catch((err) => {
         console.error('[DisplayMedia] Error fetching desktop capturer sources:', err);
         callback({ video: null, audio: null });
       });
-    }, { useSystemPicker: true }); // <-- ADDED: required on macOS so getDisplayMedia's
-                                    //     audio: 'loopback' request routes through Apple's
-                                    //     native ScreenCaptureKit picker. Without this,
-                                    //     macOS silently returns video with no audio track,
-                                    //     even after Screen Recording permission is granted.
-                                    //     Harmless / mostly no-op on Windows.
+    }, opts);
+  } else {
+    console.log('[DisplayMedia] setDisplayMediaRequestHandler is NOT available on this session/Electron version');
   }
 
   createWindow();

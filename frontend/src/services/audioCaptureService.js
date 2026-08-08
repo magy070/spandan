@@ -204,8 +204,13 @@ export async function captureWithSystemAudio(micDeviceId = null) {
     micSource.connect(micGain)
     systemSource.connect(systemGain)
 
-    micGain.connect(destination)
-    systemGain.connect(destination)
+    const silentGain = audioContext.createGain()
+    silentGain.gain.value = 0.0
+    micGain.connect(silentGain)
+    systemGain.connect(silentGain)
+    silentGain.connect(audioContext.destination)
+
+    audioContext._retainedNodes = [micSource, systemSource, micGain, systemGain, destination, silentGain]
 
     const combinedStream = destination.stream
 
@@ -232,3 +237,149 @@ export async function captureWithSystemAudio(micDeviceId = null) {
     throw error
   }
 }
+
+/**
+ * Capture Tab/System Audio via getDisplayMedia AND (optionally) Microphone stream via getUserMedia,
+ * mixing them together via Web Audio API for YouTube Video session mode.
+ *
+ * @param {Object} options
+ * @param {string|null} [options.micDeviceId] - Primary microphone device ID
+ * @param {boolean} [options.includeMic=true] - Whether to capture microphone alongside tab audio
+ * @returns {Promise<{ combinedStream: MediaStream, cleanup: Function, setMicEnabled: Function, enableMicLive: Function, isMicActive: boolean, micWarning: string|null, displayStream: MediaStream }>}
+ */
+export async function captureTabAndMicAudio({ micDeviceId = null, includeMic = true } = {}) {
+  let displayStream = null
+  let micStream = null
+  let audioContext = null
+  let micGainNode = null
+
+  try {
+    console.log('[AUDIO MIX] captureTabAndMicAudio called with options:', { micDeviceId, includeMic })
+    // 1. Get Tab / Display Audio stream
+    console.log('[AUDIO MIX] Calling getDisplayMedia...')
+    displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true
+    })
+    console.log('[AUDIO MIX] getDisplayMedia resolved:', displayStream)
+
+    // Disable video track so it doesn't render video (DO NOT call track.stop() which terminates the display stream in Chrome)
+    const videoTracks = displayStream.getVideoTracks()
+    videoTracks.forEach(track => {
+      track.enabled = false
+    })
+
+    const systemAudioTracks = displayStream.getAudioTracks()
+    if (systemAudioTracks.length === 0) {
+      displayStream.getTracks().forEach(t => t.stop())
+      throw new Error('NO_TAB_AUDIO')
+    }
+
+    // 2. If includeMic is true, attempt to capture microphone stream
+    if (includeMic) {
+      try {
+        const micConstraints = {
+          audio: micDeviceId ? { deviceId: { ideal: micDeviceId } } : true
+        }
+        micStream = await navigator.mediaDevices.getUserMedia(micConstraints)
+      } catch (micErr) {
+        console.warn('[AUDIO MIX] Initial mic capture failed:', micErr)
+        micStream = null
+      }
+    }
+
+    // 3. Mix tab audio and mic audio using Web Audio API
+    audioContext = new (window.AudioContext || window.webkitAudioContext)()
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume()
+    }
+
+    const destination = audioContext.createMediaStreamDestination()
+
+    const systemAudioStream = new MediaStream([systemAudioTracks[0]])
+    const systemSource = audioContext.createMediaStreamSource(systemAudioStream)
+    const systemGain = audioContext.createGain()
+    systemGain.gain.value = 1.0
+    systemSource.connect(systemGain)
+    systemGain.connect(destination)
+
+    const silentGain = audioContext.createGain()
+    silentGain.gain.value = 0.0
+    systemGain.connect(silentGain)
+    silentGain.connect(audioContext.destination)
+
+    let currentMicSource = null
+    const attachMicStream = (stream) => {
+      if (!stream || !audioContext || audioContext.state === 'closed') return
+      if (currentMicSource) {
+        try { currentMicSource.disconnect() } catch (e) {}
+      }
+      micStream = stream
+      const micAudioStream = new MediaStream([stream.getAudioTracks()[0]])
+      currentMicSource = audioContext.createMediaStreamSource(micAudioStream)
+      if (!micGainNode) {
+        micGainNode = audioContext.createGain()
+      }
+      micGainNode.gain.value = 1.0
+      currentMicSource.connect(micGainNode)
+      micGainNode.connect(destination)
+      micGainNode.connect(silentGain)
+      audioContext._retainedNodes.push(currentMicSource, micAudioStream, micStream)
+    }
+
+    // Retain stream and node references to prevent V8 garbage collection drops in Chromium
+    audioContext._retainedNodes = [displayStream, systemAudioStream, systemSource, systemGain, destination, silentGain]
+
+    if (micStream) {
+      attachMicStream(micStream)
+    }
+
+    const combinedStream = destination.stream
+
+    const setMicEnabled = (enabled) => {
+      if (micGainNode && audioContext && audioContext.state !== 'closed') {
+        micGainNode.gain.setValueAtTime(enabled ? 1.0 : 0.0, audioContext.currentTime)
+      }
+      if (micStream) {
+        micStream.getAudioTracks().forEach(t => { t.enabled = enabled })
+      }
+    }
+
+    const enableMicLive = async (deviceId = null) => {
+      try {
+        const constraints = { audio: deviceId ? { deviceId: { ideal: deviceId } } : true }
+        const newMicStream = await navigator.mediaDevices.getUserMedia(constraints)
+        attachMicStream(newMicStream)
+        setMicEnabled(true)
+        return { success: true, stream: newMicStream }
+      } catch (err) {
+        console.error('[AUDIO MIX] enableMicLive failed:', err)
+        return { success: false, error: err.message }
+      }
+    }
+
+    const cleanup = () => {
+      if (micStream) micStream.getTracks().forEach(t => t.stop())
+      if (displayStream) displayStream.getTracks().forEach(t => t.stop())
+      if (audioContext && audioContext.state !== 'closed') {
+        audioContext.close().catch(() => {})
+      }
+    }
+
+    return {
+      combinedStream,
+      cleanup,
+      setMicEnabled,
+      enableMicLive,
+      isMicActive: !!micStream,
+      micWarning: includeMic && !micStream ? 'Microphone capture failed — using tab audio.' : null,
+      displayStream
+    }
+  } catch (error) {
+    if (micStream) micStream.getTracks().forEach(t => t.stop())
+    if (displayStream) displayStream.getTracks().forEach(t => t.stop())
+    if (audioContext && audioContext.state !== 'closed') audioContext.close().catch(() => {})
+    throw error
+  }
+}
+
