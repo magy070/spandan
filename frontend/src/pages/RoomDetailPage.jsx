@@ -13,6 +13,7 @@ import CreateQuestionOverlay from '../components/CreateQuestionOverlay'
 import TextToQuestionsPopup from '../components/TextToQuestionsPopup'
 import RoomSettingsModal from '../components/RoomSettingsModal'
 import Leaderboard from '../components/Leaderboard'
+import ErrorBoundary from '../components/ErrorBoundary'
 import YouTubeVideo, { extractYouTubeId } from '../components/YouTubeVideo'
 import useIsMobile from '../hooks/useIsMobile'
 import { saveTranscript } from '../services/transcriptService'
@@ -940,6 +941,40 @@ function RoomDetailPage() {
   // the current broadcast instead of falling behind by the poll + answer time. We query the player
   // DIRECTLY (not the React isLiveStream state) so this fires reliably even if live-detection state
   // hasn't settled or was captured stale by an older closure.
+  // Tell the server a question pop-up just closed (a segment's questions are answered) so it folds
+  // that segment into the ranked leaderboard (per-segment). A REST call (owner-authed), fired in ALL
+  // modes — unlike video:resume, which is video-mode only — so the board updates for normal sessions.
+  const emitSegmentDone = () => {
+    if (!room?._id || !token) return
+    fetch(`${API_URL}/responses/leaderboard/${room._id}/segment-done`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    }).catch(() => {})
+  }
+
+  // Single source of truth for the per-segment leaderboard fold: fire it whenever ANY question
+  // pop-up (approval / Paste&Generate / Create-Q) goes from open -> closed, by ANY path — the last
+  // question's timer auto-closing it, rejecting the last question, or the teacher closing it
+  // manually. Guarantees the update fires exactly once per close and can't be bypassed by a
+  // particular close path.
+  const approvalPopupWasOpenRef = useRef(false)
+  const textPopupWasOpenRef = useRef(false)
+  const createPopupWasOpenRef = useRef(false)
+  useEffect(() => {
+    const open = showQuestionPopup && pendingQuestions.length > 0
+    if (approvalPopupWasOpenRef.current && !open) emitSegmentDone()
+    approvalPopupWasOpenRef.current = open
+  }, [showQuestionPopup, pendingQuestions])
+  useEffect(() => {
+    const open = showTextQuestionPopup && pendingTextQuestions.length > 0
+    if (textPopupWasOpenRef.current && !open) emitSegmentDone()
+    textPopupWasOpenRef.current = open
+  }, [showTextQuestionPopup, pendingTextQuestions])
+  useEffect(() => {
+    if (createPopupWasOpenRef.current && !showCreateQuestion) emitSegmentDone()
+    createPopupWasOpenRef.current = showCreateQuestion
+  }, [showCreateQuestion])
+
   const resumeTeacherVideo = () => {
     // Tell students the popup window is over so they resume + jump to the live edge (fire even if the
     // teacher's own player ref isn't ready).
@@ -1209,6 +1244,7 @@ function RoomDetailPage() {
   const handleTextQuestionClose = () => {
     setShowTextQuestionPopup(false)
     setPendingTextQuestions([])
+    // leaderboard fold fires via the pop-up-close watcher (textPopupWasOpenRef) on close
   }
 
   const handleCreateQuestion = async (questionData) => {
@@ -2276,7 +2312,9 @@ function RoomDetailPage() {
                   Leaderboard
                 </span>
               </div>
-              <Leaderboard roomId={room?._id} token={token} socket={socket} />
+              <ErrorBoundary message="Leaderboard unavailable">
+                <Leaderboard roomId={room?._id} token={token} socket={socket} />
+              </ErrorBoundary>
             </div>
           </div>
         </div>
@@ -2309,6 +2347,7 @@ function RoomDetailPage() {
             // Resume recording for next segment
             startRecording({ resetSegment: false })
             if (isVideoMode) resumeTeacherVideo() // resume the video (live: jump to live edge) after review
+            // leaderboard fold fires via the pop-up-close watcher (approvalPopupWasOpenRef) on close
 
             // Timer will auto-start via the useEffect since isPendingReview is now false
           }}
@@ -2325,6 +2364,7 @@ function RoomDetailPage() {
             setSegmentTimeLeft(roomSettings.segmentTime * 60)
             startRecording({ resetSegment: false })
             if (isVideoMode) resumeTeacherVideo() // resume the video (live: jump to live edge) after review
+            // leaderboard fold fires via the pop-up-close watcher (approvalPopupWasOpenRef) on close
           }}
         />
       )}
