@@ -170,7 +170,7 @@ export default function InstallAppButton() {
                     <div style={{ fontSize: '12px', color: 'var(--text-secondary, #64748b)' }}>Standalone desktop bundle</div>
                   </div>
                   <a
-                    href={(import.meta.env.BASE_URL || '/').replace(/\/+$/, '') + '/Spandan-Portable.exe'}
+                    href={'https://github.com/magy070/spandan/releases/download/v0.1.0-test/Spandan-Portable.exe'}
                     download="Spandan-Portable.exe"
                     style={{
                       padding: '8px 14px',
